@@ -61,7 +61,8 @@ VelocityView = namedview("Velocities", plant.GetVelocityNames(spot))
 
 nq = plant.num_positions()
 nv = plant.num_velocities()
-mu = 1.0
+# TODO: Figure out why tf this being 0.8 causes optimization to take forever
+mu = 1.0 # for concrete/rubber this should be 0.8
 
 ad_plant = plant.ToAutoDiffXd()
 
@@ -69,6 +70,7 @@ body_frame = plant.GetFrameByName("body")
 total_mass = plant.CalcTotalMass(plant_context, [spot])
 gravity = plant.gravity_field().gravity_vector()
 
+# FOOT ORDERING 
 foot_frame = [
     plant.GetFrameByName("front_left_lower_leg"),
     plant.GetFrameByName("front_right_lower_leg"),
@@ -374,6 +376,16 @@ start = time.time()
 result = solver.Solve(prog)
 print(result.is_success())
 print("Time to solve:", time.time() - start)
+
+########### BACKOUT FORCES ###########
+front_left = result.GetSolution(contact_force[0])
+front_right = result.GetSolution(contact_force[1])
+rear_left = result.GetSolution(contact_force[2])
+rear_right = result.GetSolution(contact_force[3])
+np.save("jump_in_place_forces/front_left_forces.npy", front_left)
+np.save("jump_in_place_forces/front_right_forces.npy", front_right)
+np.save("jump_in_place_forces/rear_left_forces.npy", rear_left)
+np.save("jump_in_place_forces/rear_right_forces.npy", rear_right)
 
 ###########   VISUALIZE   ###########
 print("Visualizing")
