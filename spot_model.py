@@ -54,7 +54,6 @@ class SpotModel:
         self._model_instance: Optional[object] = None
         self._visualizer: Optional[MeshcatVisualizer] = None
 
-
     @property
     def diagram(self) -> RobotDiagram:
         assert self._diagram is not None, "Call build_robot_diagram() first."
@@ -96,11 +95,13 @@ class SpotModel:
         (spot_instance,) = parser.AddModelsFromUrl(
             "package://underactuated/models/spot/spot.dmd.yaml"
         )
-        parser.AddModelsFromUrl("package://underactuated/models/littledog/ground.urdf")
+        parser.AddModelsFromUrl(
+            "package://underactuated/models/littledog/ground.urdf")
 
-        plant.set_discrete_contact_approximation(
-            DiscreteContactApproximation.kLagged
-        )
+        if self.time_step > 0.0:
+            plant.set_discrete_contact_approximation(
+                DiscreteContactApproximation.kLagged
+            )
 
         # Optional low-level PD on each actuated joint of Spot.
         if self.enable_joint_pd:
@@ -134,3 +135,13 @@ class SpotModel:
                 continue
             gains = PdControllerGains(p=self.joint_kp, d=self.joint_kd)
             actuator.set_controller_gains(gains)
+
+    def get_default_standing_state(self):
+        assert self._plant is not None, "Call build_robot_diagram() first."
+        plant = self._plant
+
+        q = plant.GetDefaultPositions().copy()
+        # Index 6 is base z; subtract small offset so feet are on ground.
+        q[6] -= 0.02889683
+        v = np.zeros(plant.num_velocities())
+        return q, v
