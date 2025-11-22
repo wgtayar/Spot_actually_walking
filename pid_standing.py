@@ -6,8 +6,8 @@ from pydrake.all import (
     Simulator,
 )
 import numpy as np
-from underactuated.underactuated import ConfigureParser
-from underactuated.underactuated.multibody import MakePidStateProjectionMatrix
+from underactuated import ConfigureParser
+from underactuated.multibody import MakePidStateProjectionMatrix
 
 def run_pid_control(meshcat):
     robot_builder = RobotDiagramBuilder(time_step=1e-4)
