@@ -24,7 +24,7 @@ from pydrake.all import (
     eq,
     namedview,
 )
-from underactuated.underactuated import ConfigureParser
+from underactuated import ConfigureParser
 
 def autoDiffArrayEqual(a, b):
     return np.array_equal(a, b) and np.array_equal(ExtractGradient(a), ExtractGradient(b))
