@@ -37,16 +37,32 @@ from underactuated.multibody import MakePidStateProjectionMatrix
 
 from spot_ik_helpers import SpotStickFigure
 
-## Optimization for a single foot step
+## Optimization for one or more foot steps
 # We formulate a QP that computes trajectories for all joint angles, from a start to an end footstep configuration. 
-# We do this for one foot step at a time, meaning the remaining three feet must stay in stance with the ground.
+# We support swinging one or more feet simultaneously (e.g., diagonal pairs for trot gait).
+# The remaining feet must stay in stance with the ground.
 
 def autoDiffArrayEqual(a, b):
     return np.array_equal(a, b) and np.array_equal(
         ExtractGradient(a), ExtractGradient(b)
     )
 
-def gait_optimization(plant, plant_context, spot, next_foot, foot_idx, box_height):
+def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices, box_height):
+    """
+    Args:
+        plant: MultibodyPlant instance
+        plant_context: Context for the plant
+        spot: Model instance for Spot
+        next_foot: (4, 2) array of target foot positions [x, z] in order [RB, RF, LF, LB]
+        swing_feet_indices: list/tuple of indices (in RB=0, RF=1, LF=2, LB=3 ordering) for swing feet
+        box_height: Height offset for ground level
+    
+    Returns:
+        t_sol: Time samples
+        q_sol: Joint position trajectory (PiecewisePolynomial)
+        v_sol: Joint velocity trajectory (PiecewisePolynomial)
+        q_end: Final joint configuration
+    """
     q0 = plant.GetPositions(plant_context)
 
     body_frame = plant.GetFrameByName("body")
@@ -74,27 +90,41 @@ def gait_optimization(plant, plant_context, spot, next_foot, foot_idx, box_heigh
     T = 1.5
     N = 10
     in_stance = np.ones((4, N))
-    in_stance[foot_idx, 1:-1] = 0 # foot that stepping
+    # Mark all swing feet as not in stance during the trajectory (excluding start and end)
+    for swing_idx in swing_feet_indices:
+        in_stance[swing_idx, 1:-1] = 0
 
     # COMPUTE DESIRED Q FROM FOOT POS
-    # Leg sequence: RB, RF, LF, LB
+    # next_foot is in order: FL, FR, RL, RR (indices 0, 1, 2, 3)
+    # SpotStickFigure IK expects order: RB, RF, LF, LB (rightback, rightfront, leftfront, leftback)
+    # So we need to reorder: [FL, FR, RL, RR] -> [RR, FR, FL, RL]
+    #                        [0,  1,  2,  3 ] -> [3,  1,  0,  2 ]
+    next_foot_IK = np.zeros((4, 2))
+    next_foot_IK[0, :] = next_foot[3, :]  # RB (rightback) = RR (rear_right)
+    next_foot_IK[1, :] = next_foot[1, :]  # RF (rightfront) = FR (front_right)
+    next_foot_IK[2, :] = next_foot[0, :]  # LF (leftfront) = FL (front_left)
+    next_foot_IK[3, :] = next_foot[2, :]  # LB (leftback) = RL (rear_left)
+    
     # IK takes 3D pos with negated z
-    next_foot_IK_frame = np.hstack((next_foot[:,0].reshape(4,1), np.zeros((4,1)), -1*next_foot[:,1].reshape(4,1)))
+    next_foot_IK_frame = np.hstack((next_foot_IK[:,0].reshape(4,1), np.zeros((4,1)), -1*next_foot_IK[:,1].reshape(4,1)))
     mean_x = np.mean(next_foot[:,0])
     mean_z = np.mean(next_foot[:,1])
 
     # compute body orientation (psi)
-    right_vec = next_foot[1,:] - next_foot[0,:] # RF - RB
-    left_vec = next_foot[2,:] - next_foot[3,:] # LF - LB
+    # next_foot is [FL, FR, RL, RR], so:
+    # right_vec from rear_right (3) to front_right (1)
+    # left_vec from rear_left (2) to front_left (0)
+    right_vec = next_foot[1,:] - next_foot[3,:]  # FR - RR
+    left_vec = next_foot[0,:] - next_foot[2,:]   # FL - RL
     right_psi = atan2(right_vec[1], right_vec[0])
     left_psi = atan2(left_vec[1], left_vec[0])
     mean_psi = (right_psi + left_psi)/2 # average orientation of R/L feet vectors
 
-    # Compute stance-only means (excluding the swinging foot)
-    # foot_IK_indices maps opt indices [RB, RF, LF, LB] to IK indices
-    # Since the foot being optimized is foot_idx in opt ordering, we exclude it
-    stance_foot_x = np.delete(next_foot[:,0], foot_idx)
-    stance_foot_z = np.delete(next_foot[:,1], foot_idx)
+    # Compute stance-only means (excluding all swinging feet)
+    # Build list of stance foot indices (those not in swing_feet_indices)
+    stance_indices = [i for i in range(4) if i not in swing_feet_indices]
+    stance_foot_x = next_foot[stance_indices, 0]
+    stance_foot_z = next_foot[stance_indices, 1]
     mean_x_stance = np.mean(stance_foot_x)
     mean_z_stance = np.mean(stance_foot_z)
 

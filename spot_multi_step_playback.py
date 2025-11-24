@@ -146,12 +146,13 @@ def compute_multi_step_trajectory(num_steps: int = 4):
     
     # Map our leg_index to gait_optimization index
     # Our ordering: FL (0), FR (1), RL (2), RR (3)
-    # gait_optimization ordering: RB (0), RF (1), LF (2), LB (3)
+    # gait_optimization ordering (foot_frame list): FL (0), FR (1), RL (2), RR (3)
+    # They are the SAME ordering, so identity mapping!
     our_to_opt_index = {
-        0: 2,  # front_left -> LF (index 2)
-        1: 1,  # front_right -> RF (index 1)
-        2: 3,  # rear_left -> LB (index 3)
-        3: 0,  # rear_right -> RB (index 0)
+        0: 0,  # front_left -> FL (index 0)
+        1: 1,  # front_right -> FR (index 1)
+        2: 2,  # rear_left -> RL (index 2)
+        3: 3,  # rear_right -> RR (index 3)
     }
     
     # Storage for trajectory segments
@@ -166,17 +167,19 @@ def compute_multi_step_trajectory(num_steps: int = 4):
     # Step parameters
     step_length = 0.15  # meters per step
     
-    # Diagonal gait sequence: FL -> RR -> FR -> RL
+    # Trot gait: diagonal pairs move together
     # Our leg indices: 0=FL, 1=FR, 2=RL, 3=RR
-    gait_sequence = [0, 3, 1, 2]  # front_left, rear_right, front_right, rear_left
+    # Phase 0: FL + RR swing together (indices 0, 3)
+    # Phase 1: FR + RL swing together (indices 1, 2)
+    gait_phases = [(0, 3), (1, 2)]  # (front_left, rear_right), (front_right, rear_left)
     
     print("\n" + "=" * 80)
-    print("Optimizing trajectory for each step...")
+    print("Optimizing trajectory for each phase (diagonal pair trot)...")
     print("=" * 80)
     
-    # Loop over each step, using the gait sequence
+    # Loop over each phase, swinging diagonal pairs
     for step_num in range(num_steps):
-        print(f"\n--- Step {step_num + 1}/{num_steps} ---")
+        print(f"\n--- Phase {step_num + 1}/{num_steps} ---")
         
         # Print current foot positions before planning
         print(f"  Current foot positions:")
@@ -184,61 +187,60 @@ def compute_multi_step_trajectory(num_steps: int = 4):
             pos = foot_pos_array[i, :]
             print(f"    {name:15s}: x={pos[0]:7.4f}, y={pos[1]:7.4f}, z={pos[2]:7.4f}")
         
-        # Select which leg moves based on gait sequence
-        leg_index = gait_sequence[step_num % len(gait_sequence)]
-        leg_name = leg_names[leg_index]
+        # Select which diagonal pair moves in this phase
+        swing_legs_our = gait_phases[step_num % len(gait_phases)]
         
-        # Compute target position for this leg
-        target_position = foot_pos_array[leg_index].copy()
-        target_position[0] += step_length  # Move forward in x
+        # Compute target positions for both swing legs
+        swing_leg_names = [leg_names[li] for li in swing_legs_our]
+        target_positions = []
+        for leg_idx in swing_legs_our:
+            target_pos = foot_pos_array[leg_idx].copy()
+            target_pos[0] += step_length  # Move forward in x
+            target_positions.append(target_pos)
         
-        # Create footstep manually
-        from spot_footstep_plan import Footstep
-        footstep = Footstep(
-            leg_index=leg_index,
-            leg_name=leg_name,
-            target_position=target_position
-        )
-        
-        print(f"  Selected leg from gait sequence:")
-        print(f"    Leg index: {leg_index} ({leg_name})")
-        print(f"    Target: x={footstep.target_position[0]:.4f}, "
-              f"y={footstep.target_position[1]:.4f}, z={footstep.target_position[2]:.4f}")
+        print(f"  Selected diagonal pair from gait phase:")
+        for leg_idx, leg_name, target_pos in zip(swing_legs_our, swing_leg_names, target_positions):
+            print(f"    Leg {leg_idx} ({leg_name}): target x={target_pos[0]:.4f}, "
+                  f"y={target_pos[1]:.4f}, z={target_pos[2]:.4f}")
         
         # Build next_foot array for gait_optimization
-        # gait_optimization expects shape (4, 2) with ordering: RB, RF, LF, LB
+        # gait_optimization expects shape (4, 2) with ordering: FL, FR, RL, RR (same as ours!)
         # Start with current positions (x, y only - ground plane coordinates)
         next_foot = np.zeros((4, 2))
-        next_foot[0, :] = [foot_pos_array[3, 0], foot_pos_array[3, 1]]  # RB = rear_right
-        next_foot[1, :] = [foot_pos_array[1, 0], foot_pos_array[1, 1]]  # RF = front_right
-        next_foot[2, :] = [foot_pos_array[0, 0], foot_pos_array[0, 1]]  # LF = front_left
-        next_foot[3, :] = [foot_pos_array[2, 0], foot_pos_array[2, 1]]  # LB = rear_left
+        next_foot[0, :] = [foot_pos_array[0, 0], foot_pos_array[0, 1]]  # FL = front_left
+        next_foot[1, :] = [foot_pos_array[1, 0], foot_pos_array[1, 1]]  # FR = front_right
+        next_foot[2, :] = [foot_pos_array[2, 0], foot_pos_array[2, 1]]  # RL = rear_left
+        next_foot[3, :] = [foot_pos_array[3, 0], foot_pos_array[3, 1]]  # RR = rear_right
         
-        # Map footstep leg_index to gait_optimization index
-        opt_foot_idx = our_to_opt_index[footstep.leg_index]
+        # Map both swing leg indices to gait_optimization indices
+        swing_feet_opt = [our_to_opt_index[li] for li in swing_legs_our]
         
-        # Update the stepping foot with target position
-        next_foot[opt_foot_idx, 0] = footstep.target_position[0]  # Update x
-        next_foot[opt_foot_idx, 1] = footstep.target_position[1]  # Update y
+        # Update both swing feet with their target positions
+        for leg_idx, target_pos in zip(swing_legs_our, target_positions):
+            opt_idx = our_to_opt_index[leg_idx]
+            next_foot[opt_idx, 0] = target_pos[0]  # Update x
+            next_foot[opt_idx, 1] = target_pos[1]  # Update y
         
-        opt_leg_names = ["rear_right (RB)", "front_right (RF)", 
-                        "front_left (LF)", "rear_left (LB)"]
-        print(f"  Stepping foot: {opt_leg_names[opt_foot_idx]}")
+        opt_leg_names = ["front_left (FL)", "front_right (FR)", 
+                        "rear_left (RL)", "rear_right (RR)"]
+        swing_leg_names_opt = [opt_leg_names[idx] for idx in swing_feet_opt]
+        print(f"  Swing feet (diagonal pair): {', '.join(swing_leg_names_opt)}")
         
         # Debug: print body height and foot positions
         current_q = plant.GetPositions(plant_context)
         print(f"  Debug - Body height (q[6]): {current_q[6]:.4f}")
         print(f"  Debug - next_foot array:")
         for i, name in enumerate(opt_leg_names):
-            print(f"    {name}: x={next_foot[i, 0]:.4f}, y={next_foot[i, 1]:.4f}")
+            swing_marker = " [SWING]" if i in swing_feet_opt else " [STANCE]"
+            print(f"    {name}: x={next_foot[i, 0]:.4f}, y={next_foot[i, 1]:.4f}{swing_marker}")
         
-        # Call gait_optimization for this step
+        # Call gait_optimization for this phase (with diagonal pair)
         t_step, q_step, v_step, q_end = gait_optimization(
             plant,
             plant_context,
             spot_model,
             next_foot,
-            opt_foot_idx,
+            swing_feet_opt,
             box_height
         )
         
