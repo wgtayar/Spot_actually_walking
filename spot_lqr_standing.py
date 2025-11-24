@@ -50,8 +50,27 @@ from underactuated import ConfigureParser
 
 def get_default_standing_state(plant: MultibodyPlant):
     q = plant.GetDefaultPositions().copy()
-    # Index 6 is base z
-    q[6] -= 0.02889683
+    
+    # CRITICAL: Joint angles MUST match the base height for feet to be on ground!
+    # Deep crouch configuration (Antonio's original, known to work)
+    # Joint indices: 7-9 (FL), 10-12 (FR), 13-15 (RL), 16-18 (RR)
+    # Each leg: hip_x, hip_y, knee
+    hip_x = 0.0
+    hip_y = 1.0   # ~57 deg abduction (crouched)
+    knee = -1.5   # ~-86 deg (deep crouch)
+    
+    # Base height for this configuration (experimentally validated)
+    base_z = 0.55  # This is what GetDefaultPositions() sets
+    
+    # Apply to all 4 legs
+    for leg_start in [7, 10, 13, 16]:  # Start index for each leg
+        q[leg_start] = hip_x      # hip_x
+        q[leg_start + 1] = hip_y  # hip_y  
+        q[leg_start + 2] = knee   # knee
+    
+    # Ensure base height is correct (index 6 is z position)
+    q[6] = base_z
+    
     v = np.zeros(plant.num_velocities())
     return q, v
 
