@@ -4,6 +4,7 @@
 # and play it back in Meshcat as a kinematic animation.
 
 from __future__ import annotations
+import os
 
 import numpy as np
 import time
@@ -783,8 +784,9 @@ def main():
     print("Generating Torque Analysis Plots...")
     print("=" * 80)
     
-    plot_torque_comparison(all_torque_data, save_path='/home/hassan/Underactuated-Biped/external/spot/torque_comparison.png')
-    plot_underactuation_detail(all_torque_data, save_path='/home/hassan/Underactuated-Biped/external/spot/underactuation_detail.png')
+    current_directory = os.getcwd()
+    plot_torque_comparison(all_torque_data, save_path=os.path.join(current_directory, 'torque_comparison.png'))
+    plot_underactuation_detail(all_torque_data, save_path=os.path.join(current_directory, 'underactuation_detail.png'))
     
     # Print summary
     print_motion_explanation()
