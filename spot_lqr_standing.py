@@ -363,41 +363,6 @@ def build_lqr_closed_loop_diagram(K_joint,
 
     return root_diagram, plant, q_star, v_star, S, joint_names
 
-
-# def main():
-#     # LQR gain on the contact-inclusive design plant
-#     (K_joint,
-#      x_full_star,
-#      x_joint_star,
-#      u_star,
-#      n_x_full,
-#      n_u,
-#      idx_q_act,
-#      idx_v_act) = compute_joint_space_lqr_gain()
-
-#     # Closed-loop runtime diagram with Meshcat + ground + controller.
-#     root_diagram, plant, q_star, v_star = build_lqr_closed_loop_diagram(
-#         K_joint,
-#         x_full_star,
-#         x_joint_star,
-#         u_star,
-#         n_x_full,
-#         n_u,
-#         idx_q_act,
-#         idx_v_act,
-#     )
-
-#     simulator = Simulator(root_diagram)
-#     context = simulator.get_mutable_context()
-
-#     plant_context = plant.GetMyMutableContextFromRoot(context)
-#     plant.SetPositions(plant_context, q_star)
-#     plant.SetVelocities(plant_context, v_star)
-
-#     simulator.set_target_realtime_rate(1.0)
-#     simulator.Initialize()
-#     simulator.AdvanceTo(5.0)
-
 def run_lqr_sim_with_logging(
     root_diagram,
     plant,
@@ -529,51 +494,6 @@ def run_lqr_sim_with_logging(
 
     except KeyboardInterrupt:
         print("\nSimulation stopped by user.", flush=True)
-
-
-# def main():
-#     # 1. Design the joint-space LQR around the standing pose
-#     (K_joint,
-#      x_full_star,
-#      x_joint_star,
-#      u_star,
-#      n_x_full,
-#      n_u,
-#      idx_q_act,
-#      idx_v_act) = compute_joint_space_lqr_gain()
-
-#     # 2. Build the closed-loop runtime diagram (Spot + ground + Meshcat + LQR)
-#     (root_diagram,
-#      plant,
-#      q_star,
-#      v_star,
-#      S,
-#      joint_names) = build_lqr_closed_loop_diagram(
-#         K_joint,
-#         x_full_star,
-#         x_joint_star,
-#         u_star,
-#         n_x_full,
-#         n_u,
-#         idx_q_act,
-#         idx_v_act,
-#     )
-
-#     # 3. Run the simulation with detailed logging of error + control
-#     run_lqr_sim_with_logging(
-#         root_diagram=root_diagram,
-#         plant=plant,
-#         q_star=q_star,
-#         v_star=v_star,
-#         K_joint=K_joint,
-#         x_joint_star=x_joint_star,
-#         u_star=u_star,
-#         S=S,
-#         joint_names=joint_names,
-#         t_final=10.0,   # shorter for testing
-#         dt=0.02,        # small step → smoother logs
-#         log_interval=0.10,  # log every 0.1 s of sim time
-#     )
 
 def main():
     # 1) Design LQR on the contact-inclusive model
