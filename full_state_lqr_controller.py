@@ -44,6 +44,173 @@ from pydrake.all import (
 )
 
 from underactuated import ConfigureParser
+from scipy.optimize import minimize
+
+def solve_full_state_standing_equilibrium(
+    plant: MultibodyPlant,
+    plant_context,
+    q_initial: np.ndarray,
+    v_initial: np.ndarray | None = None,
+    model_instance_name: str = "spot",
+    ground_height: float = 0.0,
+    verbose: bool = True,
+):
+    """
+    Solve for a static full-state equilibrium (q*, v* = 0, u*) for Spot
+    in contact with the ground:
+
+        x* = [q*; v* = 0],  such that  xdot = f(x*, u*) ≈ 0.
+
+    Strategy:
+      - Keep base orientation (quaternion) and base x,y fixed to q_initial.
+      - Allow base z and all joint positions to move slightly.
+      - Set v* = 0.
+      - Optimize over:
+            theta = [delta_q_free; u]
+        to minimize:
+            ||xdot_full||^2
+          + alpha_q * ||delta_q_free||^2
+          + beta_u  * ||u||^2
+          + gamma_feet * (min_foot_z - ground_height)^2
+
+    This uses the contact-inclusive dynamics via plant.CalcTimeDerivatives.
+    """
+
+    n_q = plant.num_positions()
+    n_v = plant.num_velocities()
+    n_u = plant.num_actuators()
+
+    assert q_initial.shape[0] == n_q
+    if v_initial is None:
+        v_initial = np.zeros(n_v)
+    else:
+        assert v_initial.shape[0] == n_v
+
+    # We'll only allow base z and joint positions to vary.
+    # Spot floating-base layout (from this model):
+    #   q[0:4]  = base orientation quaternion (w, x, y, z)
+    #   q[4:6]  = base x, y
+    #   q[6]    = base z
+    #   q[7:]   = joint positions
+    base_z_index = 6
+    joint_pos_indices = list(range(7, n_q))
+    free_q_indices = [base_z_index] + joint_pos_indices
+    n_free_q = len(free_q_indices)
+
+    # Allocate derivatives once for speed
+    derivs = plant.AllocateTimeDerivatives()
+
+    # Foot frames for ground penalty
+    foot_frames = _find_spot_foot_frames(plant, model_instance_name)
+
+    # Regularization weights
+    alpha_q = 1e-2   # keep q near q_initial
+    beta_u  = 1e-3   # keep u small
+    gamma_feet = 1e1 # encourage feet to stay on ground
+
+    # Initial guess for u: free-space gravity comp, like you had before
+    tau_g = plant.CalcGravityGeneralizedForces(plant_context)
+    u0 = np.zeros(n_u)
+    for i in range(n_u):
+        actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+        joint = actuator.joint()
+        assert joint.num_velocities() == 1
+        v_index = joint.velocity_start()
+        u0[i] = -tau_g[v_index]
+
+    theta0 = np.concatenate([np.zeros(n_free_q), u0])
+
+    def objective(theta: np.ndarray) -> float:
+        """
+        theta = [delta_q_free; u]
+        """
+        delta_q_free = theta[:n_free_q]
+        u = theta[n_free_q:]
+
+        # Build q from q_initial + delta_q on free indices
+        q = q_initial.copy()
+        q[free_q_indices] = q_initial[free_q_indices] + delta_q_free
+        v = np.zeros(n_v)  # static equilibrium: v* = 0
+
+        # Set state and actuation
+        plant.SetPositions(plant_context, q)
+        plant.SetVelocities(plant_context, v)
+        plant.get_actuation_input_port().FixValue(plant_context, u)
+
+        # Compute xdot = [qdot; vdot]
+        plant.CalcTimeDerivatives(plant_context, derivs)
+        xdot = derivs.get_vector().CopyToVector()
+
+        qdot = xdot[:n_q]
+        vdot = xdot[n_q:]
+
+        # Equilibrium cost: want both qdot and vdot ≈ 0
+        cost_eq = float(qdot @ qdot + vdot @ vdot)
+
+        # Regularize deviation from original pose
+        cost_reg_q = alpha_q * float(delta_q_free @ delta_q_free)
+
+        # Regularize torque magnitude
+        cost_reg_u = beta_u * float(u @ u)
+
+        # Keep feet near ground
+        cost_feet = 0.0
+        if foot_frames:
+            min_foot_z = _compute_min_foot_height(plant, plant_context, foot_frames)
+            dz = min_foot_z - ground_height
+            cost_feet = gamma_feet * float(dz * dz)
+
+        return cost_eq + cost_reg_q + cost_reg_u + cost_feet
+
+    if verbose:
+        # Evaluate at the initial guess to show how bad it is
+        plant.SetPositions(plant_context, q_initial)
+        plant.SetVelocities(plant_context, v_initial)
+        plant.get_actuation_input_port().FixValue(plant_context, u0)
+        plant.CalcTimeDerivatives(plant_context, derivs)
+        xdot_init = derivs.get_vector().CopyToVector()
+        print("\n[EQ FULL-STATE] Initial (q_initial, u0) equilibrium residual:")
+        print(f"  ||xdot|| = {np.linalg.norm(xdot_init):.3e}")
+        print(f"  max |qdot| = {np.max(np.abs(xdot_init[:n_q])):.3e}")
+        print(f"  max |vdot| = {np.max(np.abs(xdot_init[n_q:])):.3e}")
+
+    # Solve with BFGS
+    res = minimize(
+        objective,
+        theta0,
+        method="BFGS",
+        options={"maxiter": 400, "gtol": 1e-6, "disp": verbose},
+    )
+
+    theta_star = res.x
+    delta_q_free_star = theta_star[:n_free_q]
+    u_star = theta_star[n_free_q:]
+
+    # Build final q*, v* = 0
+    q_star = q_initial.copy()
+    q_star[free_q_indices] = q_initial[free_q_indices] + delta_q_free_star
+    v_star = np.zeros(n_v)
+
+    # Evaluate xdot at the solution for reporting
+    plant.SetPositions(plant_context, q_star)
+    plant.SetVelocities(plant_context, v_star)
+    plant.get_actuation_input_port().FixValue(plant_context, u_star)
+    plant.CalcTimeDerivatives(plant_context, derivs)
+    xdot_star = derivs.get_vector().CopyToVector()
+
+    if verbose:
+        print("\n[EQ FULL-STATE] Optimized standing equilibrium:")
+        print(f"  success = {res.success},  message = {res.message}")
+        print(f"  ||xdot|| = {np.linalg.norm(xdot_star):.3e}")
+        print(f"  max |qdot| = {np.max(np.abs(xdot_star[:n_q])):.3e}")
+        print(f"  max |vdot| = {np.max(np.abs(xdot_star[n_q:])):.3e}")
+        # Optional: check foot heights
+        if foot_frames:
+            min_foot_z = _compute_min_foot_height(plant, plant_context, foot_frames)
+            print(f"  min foot z at equilibrium: {min_foot_z:+.4f} m")
+
+    return q_star, v_star, u_star
+
 
 
 def _find_spot_foot_frames(
@@ -684,9 +851,77 @@ def compute_full_joint_space_lqr_gain():
     plant_context = plant.GetMyMutableContextFromRoot(diagram_context)
 
     # Nice standing pose with all feet on the ground and v = 0.
-    q_full_star, v_full_star = get_default_standing_state(plant)
-    plant.SetPositions(plant_context, q_full_star)
-    plant.SetVelocities(plant_context, v_full_star)
+    # q_full_star, v_full_star = get_default_standing_state(plant)
+    # plant.SetPositions(plant_context, q_full_star)
+    # plant.SetVelocities(plant_context, v_full_star)
+
+    # n_q = plant.num_positions()
+    # n_v = plant.num_velocities()
+    # n_x_full = n_q + n_v
+    # n_u = plant.num_actuators()
+
+    # # Actuated joint indices (for logging and for S later)
+    # idx_q_act = []
+    # idx_v_act = []
+    # joint_names_act = []
+    # for i in range(plant.num_actuators()):
+    #     actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+    #     joint = actuator.joint()
+    #     nq_j = joint.num_positions()
+    #     nv_j = joint.num_velocities()
+    #     q0_j = joint.position_start()
+    #     v0_j = joint.velocity_start()
+    #     for k in range(nq_j):
+    #         idx_q_act.append(q0_j + k)
+    #         joint_names_act.append(joint.name())
+    #     for k in range(nv_j):
+    #         idx_v_act.append(v0_j + k)
+    # n_act = len(idx_q_act)
+    # assert n_act == len(idx_v_act)
+
+    # print("\n" + "=" * 80)
+    # print("[LQR FULL-STATE] Linearization + equilibrium setup")
+    # print("=" * 80)
+    # print(f"  Total generalized coordinates n_q        = {n_q}")
+    # print(f"  Total generalized velocities n_v        = {n_v}")
+    # print(f"  Total full state dimension n_x_full    = {n_x_full}")
+    # print(f"  Number of actuators n_u                = {n_u}")
+    # print(f"  Number of actuated joint positions     = {n_act}")
+    # print("\n  Actuated joints (design model):")
+    # for k, name in enumerate(joint_names_act):
+    #     print(
+    #         f"    [{k:2d}] '{name}' "
+    #         f"(q index {idx_q_act[k]}, v index {idx_v_act[k]})"
+    #     )
+    # print("=" * 80 + "\n")
+
+    # # --- Check that feet are actually on the ground at the chosen q* ---
+    # check_foot_contacts_at_pose(plant, plant_context, model_instance_name="spot")
+
+    # # ------------------------------------------------------------------
+    # # 2) Define equilibrium torques u* (gravity-comp at q*, v* = 0)
+    # # ------------------------------------------------------------------
+    # derivs = plant.AllocateTimeDerivatives()
+
+    # # Gravity generalized forces (size n_v).  For each 1-DoF joint, we map
+    # # the corresponding entry of tau_g to that joint's actuator torque.
+    # tau_g = plant.CalcGravityGeneralizedForces(plant_context)
+    # u_star = np.zeros(n_u)
+    # for i in range(n_u):
+    #     actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+    #     joint = actuator.joint()
+    #     assert joint.num_velocities() == 1, "Assuming 1-DoF joints for Spot"
+    #     v_index = joint.velocity_start()
+    #     u_star[i] = -tau_g[v_index]
+
+    # # Full equilibrium state
+    # x_full_star = np.concatenate([q_full_star, v_full_star])
+    
+    
+    # Nice standing pose with all feet on the ground and v = 0 (geometric guess).
+    q_full_guess, v_full_guess = get_default_standing_state(plant)
+    plant.SetPositions(plant_context, q_full_guess)
+    plant.SetVelocities(plant_context, v_full_guess)
 
     n_q = plant.num_positions()
     n_v = plant.num_velocities()
@@ -728,27 +963,33 @@ def compute_full_joint_space_lqr_gain():
         )
     print("=" * 80 + "\n")
 
-    # --- Check that feet are actually on the ground at the chosen q* ---
+    # --- Check that feet are actually on the ground at the geometric guess ---
     check_foot_contacts_at_pose(plant, plant_context, model_instance_name="spot")
 
     # ------------------------------------------------------------------
-    # 2) Define equilibrium torques u* (gravity-comp at q*, v* = 0)
+    # 2) Solve for a true static equilibrium (q*, v* = 0, u*)
     # ------------------------------------------------------------------
-    derivs = plant.AllocateTimeDerivatives()
+    q_full_star, v_full_star, u_star = solve_full_state_standing_equilibrium(
+        plant=plant,
+        plant_context=plant_context,
+        q_initial=q_full_guess,
+        v_initial=v_full_guess,
+        model_instance_name="spot",
+        ground_height=0.0,
+        verbose=True,
+    )
 
-    # Gravity generalized forces (size n_v).  For each 1-DoF joint, we map
-    # the corresponding entry of tau_g to that joint's actuator torque.
-    tau_g = plant.CalcGravityGeneralizedForces(plant_context)
-    u_star = np.zeros(n_u)
-    for i in range(n_u):
-        actuator = plant.get_joint_actuator(JointActuatorIndex(i))
-        joint = actuator.joint()
-        assert joint.num_velocities() == 1, "Assuming 1-DoF joints for Spot"
-        v_index = joint.velocity_start()
-        u_star[i] = -tau_g[v_index]
+    # Set context to the solved equilibrium
+    plant.SetPositions(plant_context, q_full_star)
+    plant.SetVelocities(plant_context, v_full_star)
 
     # Full equilibrium state
     x_full_star = np.concatenate([q_full_star, v_full_star])
+
+    # Allocate derivatives for later use in f_full
+    derivs = plant.AllocateTimeDerivatives()
+
+    
 
     def f_full(x_full: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
