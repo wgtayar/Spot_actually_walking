@@ -211,6 +211,103 @@ def solve_full_state_standing_equilibrium(
 
     return q_star, v_star, u_star
 
+def solve_fixed_pose_joint_equilibrium(
+    plant: MultibodyPlant,
+    base_context,
+    q_standing: np.ndarray,
+    idx_v_act,
+    torque_init: np.ndarray | None = None,
+    torque_reg: float = 1e-4,
+    verbose: bool = True,
+):
+    """
+    Given a fixed standing pose q_standing and v = 0, solve for actuator torques u
+    that make the full generalized accelerations vdot as small as possible:
+
+        u* = argmin_u  ||vdot(q_standing, v=0, u)||^2 + torque_reg * ||u||^2
+
+    where vdot is the full vector of generalized accelerations (base + joints)
+    returned by the MultibodyPlant.
+
+    We *do not* change q_standing in this solver – it stays exactly as passed in.
+    """
+
+    n_q = plant.num_positions()
+    n_v = plant.num_velocities()
+    n_u = plant.num_actuators()
+
+    assert q_standing.shape[0] == n_q
+
+    derivs = plant.AllocateTimeDerivatives()
+
+    if torque_init is None:
+        u0 = np.zeros(n_u)
+    else:
+        u0 = np.asarray(torque_init).copy()
+
+    def eval_xdot(u_vec: np.ndarray):
+        """
+        Evaluate xdot = [qdot; vdot] at (q_standing, v=0, u_vec).
+
+        We reuse the same plant context (base_context) and simply overwrite
+        positions, velocities, and actuation each call.
+        """
+        # Use the existing plant subcontext directly (no Clone).
+        ctx = base_context
+
+        # Set the fixed standing pose and zero velocities
+        plant.SetPositions(ctx, q_standing)
+        plant.SetVelocities(ctx, np.zeros(n_v))
+
+        # Apply candidate torques
+        plant.get_actuation_input_port().FixValue(ctx, u_vec)
+
+        # Compute time derivatives
+        plant.CalcTimeDerivatives(ctx, derivs)
+        xdot = derivs.get_vector().CopyToVector()
+        qdot = xdot[:n_q]
+        vdot = xdot[n_q:]
+        return qdot, vdot, xdot
+
+    def objective(u_vec: np.ndarray) -> float:
+        # qdot is always zero since v=0, so we only penalize vdot
+        _, vdot, _ = eval_xdot(u_vec)
+        cost_eq = float(vdot @ vdot)
+        cost_reg = torque_reg * float(u_vec @ u_vec)
+        return cost_eq + cost_reg
+
+    if verbose:
+        qdot0, vdot0, xdot0 = eval_xdot(u0)
+        print("\n[EQ FIXED-POSE] Initial equilibrium residual at fixed pose:")
+        print(f"  ||vdot||        = {np.linalg.norm(vdot0):.3e}")
+        print(f"  max |vdot|      = {np.max(np.abs(vdot0)):.3e}")
+        if len(idx_v_act) > 0:
+            vdot_act0 = vdot0[idx_v_act]
+            print(f"  max |vdot_act|  = {np.max(np.abs(vdot_act0)):.3e}")
+        print(f"  max |xdot_full| = {np.max(np.abs(xdot0)):.3e}")
+
+    res = minimize(
+        objective,
+        u0,
+        method="BFGS",
+        options={"maxiter": 200, "gtol": 1e-6, "disp": verbose},
+    )
+
+    u_star = res.x
+    qdot_star, vdot_star, xdot_star = eval_xdot(u_star)
+
+    if verbose:
+        print("\n[EQ FIXED-POSE] Joint equilibrium solve at fixed standing pose:")
+        print(f"  success         = {res.success},  message = {res.message}")
+        print(f"  final cost      = {res.fun:.3e}")
+        print(f"  ||vdot||        = {np.linalg.norm(vdot_star):.3e}")
+        print(f"  max |vdot|      = {np.max(np.abs(vdot_star)):.3e}")
+        if len(idx_v_act) > 0:
+            vdot_act_star = vdot_star[idx_v_act]
+            print(f"  max |vdot_act|  = {np.max(np.abs(vdot_act_star)):.3e}")
+        print(f"  max |xdot_full| = {np.max(np.abs(xdot_star)):.3e}")
+
+    return u_star, vdot_star, xdot_star
 
 
 def _find_spot_foot_frames(
@@ -818,20 +915,468 @@ def run_lqr_sim_with_logging(
 # FULL-STATE (FLOATING-BASE) LQR
 # =============================================================================
 
+# def compute_full_joint_space_lqr_gain():
+#     """
+#     Full-state (floating-base) LQR, but now using a clean standing pose:
+
+#       1) Choose a standing equilibrium:
+#            x* = [q*; 0],  u* = gravity-comp torques at q*,
+#          where q* is obtained from get_default_standing_state, with the base
+#          z shifted so that all feet are on the ground.
+
+#       2) Numerically linearize xdot = f(x, u) around (x*, u*).
+
+#       3) Build a REDUCED state (dropping base x,y) to avoid uncontrollable
+#          modes, regularize any uncontrollable zero modes, solve LQR on the
+#          reduced system, then embed the gain back into the full 37D state.
+
+#     Returns:
+#         K_full:          (n_u, n_x_full) LQR gain (embedded from reduced state)
+#         x_full_star:     (n_x_full,) equilibrium state [q*; v* = 0]
+#         u_star:          (n_u,) equilibrium torques
+#         n_x_full:        full state dimension
+#         n_u:             number of actuators
+#         idx_q_act:       indices of actuated joint positions in q
+#         idx_v_act:       indices of actuated joint velocities in v
+#         joint_names_act: list of actuated joint names
+#     """
+#     # ------------------------------------------------------------------
+#     # 1) Build design diagram and choose standing equilibrium (q*, v* = 0)
+#     # ------------------------------------------------------------------
+#     diagram, plant = build_spot_design_diagram(time_step=0.0)
+#     diagram_context = diagram.CreateDefaultContext()
+#     plant_context = plant.GetMyMutableContextFromRoot(diagram_context)
+
+#     # Nice standing pose with all feet on the ground and v = 0.
+#     # q_full_star, v_full_star = get_default_standing_state(plant)
+#     # plant.SetPositions(plant_context, q_full_star)
+#     # plant.SetVelocities(plant_context, v_full_star)
+
+#     # n_q = plant.num_positions()
+#     # n_v = plant.num_velocities()
+#     # n_x_full = n_q + n_v
+#     # n_u = plant.num_actuators()
+
+#     # # Actuated joint indices (for logging and for S later)
+#     # idx_q_act = []
+#     # idx_v_act = []
+#     # joint_names_act = []
+#     # for i in range(plant.num_actuators()):
+#     #     actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+#     #     joint = actuator.joint()
+#     #     nq_j = joint.num_positions()
+#     #     nv_j = joint.num_velocities()
+#     #     q0_j = joint.position_start()
+#     #     v0_j = joint.velocity_start()
+#     #     for k in range(nq_j):
+#     #         idx_q_act.append(q0_j + k)
+#     #         joint_names_act.append(joint.name())
+#     #     for k in range(nv_j):
+#     #         idx_v_act.append(v0_j + k)
+#     # n_act = len(idx_q_act)
+#     # assert n_act == len(idx_v_act)
+
+#     # print("\n" + "=" * 80)
+#     # print("[LQR FULL-STATE] Linearization + equilibrium setup")
+#     # print("=" * 80)
+#     # print(f"  Total generalized coordinates n_q        = {n_q}")
+#     # print(f"  Total generalized velocities n_v        = {n_v}")
+#     # print(f"  Total full state dimension n_x_full    = {n_x_full}")
+#     # print(f"  Number of actuators n_u                = {n_u}")
+#     # print(f"  Number of actuated joint positions     = {n_act}")
+#     # print("\n  Actuated joints (design model):")
+#     # for k, name in enumerate(joint_names_act):
+#     #     print(
+#     #         f"    [{k:2d}] '{name}' "
+#     #         f"(q index {idx_q_act[k]}, v index {idx_v_act[k]})"
+#     #     )
+#     # print("=" * 80 + "\n")
+
+#     # # --- Check that feet are actually on the ground at the chosen q* ---
+#     # check_foot_contacts_at_pose(plant, plant_context, model_instance_name="spot")
+
+#     # # ------------------------------------------------------------------
+#     # # 2) Define equilibrium torques u* (gravity-comp at q*, v* = 0)
+#     # # ------------------------------------------------------------------
+#     # derivs = plant.AllocateTimeDerivatives()
+
+#     # # Gravity generalized forces (size n_v).  For each 1-DoF joint, we map
+#     # # the corresponding entry of tau_g to that joint's actuator torque.
+#     # tau_g = plant.CalcGravityGeneralizedForces(plant_context)
+#     # u_star = np.zeros(n_u)
+#     # for i in range(n_u):
+#     #     actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+#     #     joint = actuator.joint()
+#     #     assert joint.num_velocities() == 1, "Assuming 1-DoF joints for Spot"
+#     #     v_index = joint.velocity_start()
+#     #     u_star[i] = -tau_g[v_index]
+
+#     # # Full equilibrium state
+#     # x_full_star = np.concatenate([q_full_star, v_full_star])
+    
+    
+#     # Nice standing pose with all feet on the ground and v = 0 (geometric guess).
+#     q_full_guess, v_full_guess = get_default_standing_state(plant)
+#     plant.SetPositions(plant_context, q_full_guess)
+#     plant.SetVelocities(plant_context, v_full_guess)
+
+#     n_q = plant.num_positions()
+#     n_v = plant.num_velocities()
+#     n_x_full = n_q + n_v
+#     n_u = plant.num_actuators()
+
+#     # Actuated joint indices (for logging and for S later)
+#     idx_q_act = []
+#     idx_v_act = []
+#     joint_names_act = []
+#     for i in range(plant.num_actuators()):
+#         actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+#         joint = actuator.joint()
+#         nq_j = joint.num_positions()
+#         nv_j = joint.num_velocities()
+#         q0_j = joint.position_start()
+#         v0_j = joint.velocity_start()
+#         for k in range(nq_j):
+#             idx_q_act.append(q0_j + k)
+#             joint_names_act.append(joint.name())
+#         for k in range(nv_j):
+#             idx_v_act.append(v0_j + k)
+#     n_act = len(idx_q_act)
+#     assert n_act == len(idx_v_act)
+
+#     print("\n" + "=" * 80)
+#     print("[LQR FULL-STATE] Linearization + equilibrium setup")
+#     print("=" * 80)
+#     print(f"  Total generalized coordinates n_q        = {n_q}")
+#     print(f"  Total generalized velocities n_v        = {n_v}")
+#     print(f"  Total full state dimension n_x_full    = {n_x_full}")
+#     print(f"  Number of actuators n_u                = {n_u}")
+#     print(f"  Number of actuated joint positions     = {n_act}")
+#     print("\n  Actuated joints (design model):")
+#     for k, name in enumerate(joint_names_act):
+#         print(
+#             f"    [{k:2d}] '{name}' "
+#             f"(q index {idx_q_act[k]}, v index {idx_v_act[k]})"
+#         )
+#     print("=" * 80 + "\n")
+
+#     # --- Check that feet are actually on the ground at the geometric guess ---
+#     check_foot_contacts_at_pose(plant, plant_context, model_instance_name="spot")
+
+#     # ------------------------------------------------------------------
+#     # 2) Solve for a true static equilibrium (q*, v* = 0, u*)
+#     # ------------------------------------------------------------------
+#     q_full_star, v_full_star, u_star = solve_full_state_standing_equilibrium(
+#         plant=plant,
+#         plant_context=plant_context,
+#         q_initial=q_full_guess,
+#         v_initial=v_full_guess,
+#         model_instance_name="spot",
+#         ground_height=0.0,
+#         verbose=True,
+#     )
+
+#     # Set context to the solved equilibrium
+#     plant.SetPositions(plant_context, q_full_star)
+#     plant.SetVelocities(plant_context, v_full_star)
+
+#     # Full equilibrium state
+#     x_full_star = np.concatenate([q_full_star, v_full_star])
+
+#     # Allocate derivatives for later use in f_full
+#     derivs = plant.AllocateTimeDerivatives()
+
+    
+
+#     def f_full(x_full: np.ndarray, u: np.ndarray) -> np.ndarray:
+#         """
+#         Continuous-time dynamics xdot = f(x, u) for the full floating-base
+#         Spot model with contact.
+#         """
+#         assert x_full.shape[0] == n_x_full
+#         assert u.shape[0] == n_u
+#         q = x_full[:n_q]
+#         v = x_full[n_q:]
+#         plant.SetPositions(plant_context, q)
+#         plant.SetVelocities(plant_context, v)
+#         plant.get_actuation_input_port().FixValue(plant_context, u)
+#         plant.CalcTimeDerivatives(plant_context, derivs)
+#         return derivs.get_vector().CopyToVector()
+
+#     xdot0_full = f_full(x_full_star, u_star)
+
+#     print("[LQR FULL-STATE] Standing equilibrium used for LQR:")
+#     print(f"  ||u_star||_inf          = {np.max(np.abs(u_star)):.3e} N·m")
+#     print(f"  ||xdot0_full||          = {np.linalg.norm(xdot0_full):.3e}")
+#     print(f"  max |qdot|              = {np.max(np.abs(xdot0_full[:n_q])):.3e}")
+#     print(f"  max |vdot|              = {np.max(np.abs(xdot0_full[n_q:])):.3e}\n")
+
+#     # ------------------------------------------------------------------
+#     # 3) Numerical linearization around (x_full_star, u_star)
+#     # ------------------------------------------------------------------
+#     eps_x = 1e-6
+#     eps_u = 1e-4
+
+#     A_full = np.zeros((n_x_full, n_x_full))
+#     B_full = np.zeros((n_x_full, n_u))
+
+#     # A_full = ∂f/∂x
+#     for i in range(n_x_full):
+#         x_pert = x_full_star.copy()
+#         x_pert[i] += eps_x
+#         xdot_pert = f_full(x_pert, u_star)
+#         A_full[:, i] = (xdot_pert - xdot0_full) / eps_x
+
+#     # B_full = ∂f/∂u
+#     for j in range(n_u):
+#         u_pert = u_star.copy()
+#         u_pert[j] += eps_u
+#         xdot_pert = f_full(x_full_star, u_pert)
+#         B_full[:, j] = (xdot_pert - xdot0_full) / eps_u
+
+#     print(f"[LQR FULL-STATE] Numerical model: n_x_full = {n_x_full}, n_u = {n_u}")
+#     print(f"[LQR FULL-STATE] ||xdot0_full|| at equilibrium ≈ "
+#           f"{np.linalg.norm(xdot0_full):.3e}\n")
+
+#     # ------------------------------------------------------------------
+#     # 4) LQR weights on FULL state (for diagnostics; we'll reduce later)
+#     # ------------------------------------------------------------------
+#     Q_full = np.eye(n_x_full)
+
+#     # Position indices
+#     idx_quat = [0, 1, 2, 3]      # base orientation (quaternion)
+#     idx_base_xy = [4, 5]         # base x, y
+#     idx_base_z = [6]             # base z
+#     idx_joint_pos = list(range(7, n_q))
+
+#     # Velocity indices
+#     idx_base_vel = list(range(n_q, n_q + 6))           # base angular + linear
+#     idx_joint_vel = list(range(n_q + 6, n_q + n_v))    # joint velocities
+
+#     base_pos_weight = 15.0
+#     joint_pos_weight = 15.0
+#     base_vel_weight = 10.0
+#     joint_vel_weight = 10.0
+
+#     # Base orientation + z
+#     for i in idx_quat + idx_base_z:
+#         Q_full[i, i] *= base_pos_weight
+
+#     # Do NOT penalize x,y translation directly (unactuated symmetries)
+#     for i in idx_base_xy:
+#         Q_full[i, i] *= 0.0
+
+#     # Joints
+#     for i in idx_joint_pos:
+#         Q_full[i, i] *= joint_pos_weight
+
+#     # Base velocities
+#     for i in idx_base_vel:
+#         Q_full[i, i] *= base_vel_weight
+
+#     # Joint velocities
+#     for i in idx_joint_vel:
+#         Q_full[i, i] *= joint_vel_weight
+
+#     # Strong penalty on torque to keep gains moderate
+#     R_scale = 10.0
+#     R = np.eye(n_u) * R_scale
+
+#     print("[LQR FULL-STATE] Cost weights:")
+#     print(f"  Base orientation/z weight:   {base_pos_weight}")
+#     print(f"  Joint position weight:       {joint_pos_weight}")
+#     print(f"  Base velocity weight:        {base_vel_weight}")
+#     print(f"  Joint velocity weight:       {joint_vel_weight}")
+#     print(f"  Torque cost scaling (R_scale): {R_scale}")
+#     print(f"  Q_full shape: {Q_full.shape}, R shape: {R.shape}")
+
+#     # --- Eigenvalue analysis for FULL state ---
+#     eigvals, eigvecs = np.linalg.eig(A_full)
+#     print("\n[LQR FULL-STATE] Eigenvalues of A_full:")
+#     for i, lam in enumerate(eigvals):
+#         print(f"  mode {i:2d}: λ = {lam.real:+8.4e} + {lam.imag:+8.4e}j")
+
+#     # --- Approximate controllability / observability per mode ---
+#     print("\n[LQR FULL-STATE] Mode controllability / observability (full state):")
+#     for i, lam in enumerate(eigvals):
+#         v = eigvecs[:, i]
+#         ctr = np.linalg.norm(B_full.T @ v)
+#         obs = np.linalg.norm(Q_full @ v)
+#         flag = ""
+#         if lam.real >= -1e-6 and ctr < 1e-6:
+#             flag += " UNCONTROLLABLE_NONSTABLE"
+#         if lam.real >= -1e-6 and obs < 1e-6:
+#             flag += " UNOBSERVABLE_NONSTABLE"
+#         print(
+#             f"  mode {i:2d}: λ = {lam.real:+8.4e} + {lam.imag:+8.4e}j, "
+#             f"||B^T v|| = {ctr:.3e}, ||Q v|| = {obs:.3e}{flag}"
+#         )
+
+#     print("\n[LQR FULL-STATE] Dominant state components for uncontrollable nonstable modes (full state):")
+#     bad_threshold_ctr = 1e-6
+#     for i, lam in enumerate(eigvals):
+#         v = eigvecs[:, i]
+#         ctr = np.linalg.norm(B_full.T @ v)
+#         if lam.real >= -1e-6 and ctr < bad_threshold_ctr:
+#             print(f"\n  >>> Suspect mode {i} (λ = {lam})")
+#             idxs = np.argsort(-np.abs(v))[:8]
+#             for idx in idxs:
+#                 print(f"    state {idx:2d}: v[{idx}] = {v[idx]:+8.4e}")
+
+#     # ------------------------------------------------------------------
+#     # 5) REDUCED-STATE LQR: drop base x,y and regularize bad zero modes
+#     # ------------------------------------------------------------------
+#     drop_state_indices = np.array([4, 5], dtype=int)
+#     keep_state_indices = np.setdiff1d(np.arange(n_x_full), drop_state_indices)
+
+#     A_red = A_full[np.ix_(keep_state_indices, keep_state_indices)]
+#     B_red = B_full[keep_state_indices, :]
+#     Q_red = Q_full[np.ix_(keep_state_indices, keep_state_indices)]
+
+#     n_x_red = A_red.shape[0]
+#     print("\n[LQR FULL-STATE] Reduced-state model for LQR:")
+#     print(f"  Dropping base translation positions from LQR state: indices {drop_state_indices.tolist()}")
+#     print(f"  n_x_red = {n_x_red}, n_u = {B_red.shape[1]}")
+
+#     def describe_state_index_full(k: int) -> str:
+#         """Helper to print which coordinate a full state index corresponds to."""
+#         if k < n_q:
+#             if k == 0:
+#                 return "q[0] (base quat w)"
+#             elif k in [1, 2, 3]:
+#                 return f"q[{k}] (base quat imag)"
+#             elif k == 4:
+#                 return "q[4] (base x)"
+#             elif k == 5:
+#                 return "q[5] (base y)"
+#             elif k == 6:
+#                 return "q[6] (base z)"
+#             else:
+#                 return f"q[{k}] (joint position)"
+#         else:
+#             idx_v = k - n_q
+#             if idx_v < 6:
+#                 return f"v[{idx_v}] (base velocity)"
+#             else:
+#                 return f"v[{idx_v}] (joint velocity)"
+
+#     # Eigen-analysis on reduced system
+#     eigvals_red, eigvecs_red = np.linalg.eig(A_red)
+#     print("\n[LQR FULL-STATE] Eigenvalues of A_red (reduced state):")
+#     for i, lam in enumerate(eigvals_red):
+#         print(f"  red mode {i:2d}: λ = {lam.real:+8.4e} + {lam.imag:+8.4e}j")
+
+#     print("\n[LQR FULL-STATE] Mode controllability / observability (reduced state):")
+#     for i, lam in enumerate(eigvals_red):
+#         v = eigvecs_red[:, i]
+#         ctr = np.linalg.norm(B_red.T @ v)
+#         obs = np.linalg.norm(Q_red @ v)
+#         flag = ""
+#         if lam.real >= -1e-6 and ctr < 1e-6:
+#             flag += " UNCONTROLLABLE_NONSTABLE"
+#         if lam.real >= -1e-6 and obs < 1e-6:
+#             flag += " UNOBSERVABLE_NONSTABLE"
+#         print(
+#             f"  red mode {i:2d}: λ = {lam.real:+8.4e} + {lam.imag:+8.4e}j, "
+#             f"||B_red^T v|| = {ctr:.3e}, ||Q_red v|| = {obs:.3e}{flag}"
+#         )
+
+#     # --- Identify uncontrollable zero modes and regularize them ---
+#     zero_tol = 1e-8
+#     ctr_tol = 1e-6
+#     leak_rate = 1e-3  # small negative leak
+
+#     print("\n[LQR FULL-STATE] Regularizing uncontrollable zero modes in A_red (if any):")
+#     leak_targets = []
+
+#     for i, lam in enumerate(eigvals_red):
+#         if abs(lam.real) < zero_tol and abs(lam.imag) < zero_tol:
+#             v = eigvecs_red[:, i]
+#             ctr = np.linalg.norm(B_red.T @ v)
+#             if ctr < ctr_tol:
+#                 # This eigenmode is (numerically) uncontrollable and zero
+#                 j_max = int(np.argmax(np.abs(v)))
+#                 full_idx = int(keep_state_indices[j_max])
+#                 desc = describe_state_index_full(full_idx)
+#                 leak_targets.append(j_max)
+#                 print(
+#                     f"  -> red mode {i}: λ ≈ 0, uncontrollable. "
+#                     f"Dominant reduced state index {j_max} "
+#                     f"(full index {full_idx}: {desc})."
+#                 )
+
+#     if leak_targets:
+#         leak_targets = sorted(set(leak_targets))
+#         for j in leak_targets:
+#             full_idx = int(keep_state_indices[j])
+#             desc = describe_state_index_full(full_idx)
+#             print(f"     Applying leak: A_red[{j},{j}] -= {leak_rate:.1e} "
+#                   f"(full index {full_idx}: {desc})")
+#             A_red[j, j] -= leak_rate
+#     else:
+#         print("  No uncontrollable zero modes detected; no regularization applied.")
+
+#     # Recompute eigenvalues after regularization
+#     eigvals_red_reg, _ = np.linalg.eig(A_red)
+#     print("\n[LQR FULL-STATE] Eigenvalues of A_red AFTER regularization:")
+#     for i, lam in enumerate(eigvals_red_reg):
+#         print(f"  red-reg mode {i:2d}: λ = {lam.real:+8.4e} + {lam.imag:+8.4e}j")
+
+#     # ------------------------------------------------------------------
+#     # 6) Continuous-time LQR on regularized REDUCED (A_red, B_red)
+#     # ------------------------------------------------------------------
+#     print("\n[LQR FULL-STATE] Computing continuous-time LQR on reduced state (A_red, B_red) ...")
+#     try:
+#         K_red, _ = LinearQuadraticRegulator(A_red, B_red, Q_red, R)
+#         print("[LQR FULL-STATE] CARE on reduced system succeeded.")
+#     except RuntimeError as e:
+#         print("[LQR FULL-STATE] CARE STILL FAILED on (A_red, B_red).")
+#         print("  ", e)
+#         raise
+
+#     # Embed K_red back into full state: columns for dropped indices are zero.
+#     K_full = np.zeros((n_u, n_x_full))
+#     K_full[:, keep_state_indices] = K_red
+
+#     # Diagnostics on closed-loop full system
+#     eig_cl = np.linalg.eigvals(A_full - B_full @ K_full)
+
+#     print("\n[LQR FULL-STATE] Embedded LQR gain matrix K_full (full state):")
+#     print(f"  K_full shape: {K_full.shape}")
+#     print(f"  ‖K_full‖_∞ = {np.max(np.abs(K_full)):.3e}")
+#     print("[LQR FULL-STATE] Closed-loop eigenvalues of (A_full - B_full K_full):")
+#     for i, lam in enumerate(eig_cl):
+#         print(f"  cl mode {i:2d}: λ = {lam.real:+8.4e} + {lam.imag:+8.4e}j")
+#     print(f"  max Re(eig(A_full - B_full K_full)) = {np.max(eig_cl.real):.3e}")
+#     print("=" * 80 + "\n")
+
+#     return (
+#         K_full,
+#         x_full_star,
+#         u_star,
+#         n_x_full,
+#         n_u,
+#         idx_q_act,
+#         idx_v_act,
+#         joint_names_act,
+#     )
+
 def compute_full_joint_space_lqr_gain():
     """
-    Full-state (floating-base) LQR, but now using a clean standing pose:
+    Full-state (floating-base) LQR around a clean standing pose:
 
-      1) Choose a standing equilibrium:
-           x* = [q*; 0],  u* = gravity-comp torques at q*,
-         where q* is obtained from get_default_standing_state, with the base
-         z shifted so that all feet are on the ground.
+      1) Choose a standing pose q* using get_default_standing_state so that
+         all feet lie on the ground (base z shifted accordingly), with v* = 0.
 
-      2) Numerically linearize xdot = f(x, u) around (x*, u*).
+      2) Solve for actuator torques u* that best support this fixed pose,
+         by minimizing the generalized accelerations vdot at (q*, v=0, u).
 
-      3) Build a REDUCED state (dropping base x,y) to avoid uncontrollable
-         modes, regularize any uncontrollable zero modes, solve LQR on the
-         reduced system, then embed the gain back into the full 37D state.
+      3) Numerically linearize xdot = f(x, u) around (x*, u*), where
+           x* = [q*; v* = 0].
+
+      4) Build a REDUCED state (dropping base x,y), regularize uncontrollable
+         zero modes, solve LQR on the reduced system, then embed the gain
+         back into the full 37D state.
 
     Returns:
         K_full:          (n_u, n_x_full) LQR gain (embedded from reduced state)
@@ -844,81 +1389,13 @@ def compute_full_joint_space_lqr_gain():
         joint_names_act: list of actuated joint names
     """
     # ------------------------------------------------------------------
-    # 1) Build design diagram and choose standing equilibrium (q*, v* = 0)
+    # 1) Build design diagram and choose standing pose (q*, v* = 0)
     # ------------------------------------------------------------------
     diagram, plant = build_spot_design_diagram(time_step=0.0)
     diagram_context = diagram.CreateDefaultContext()
     plant_context = plant.GetMyMutableContextFromRoot(diagram_context)
 
-    # Nice standing pose with all feet on the ground and v = 0.
-    # q_full_star, v_full_star = get_default_standing_state(plant)
-    # plant.SetPositions(plant_context, q_full_star)
-    # plant.SetVelocities(plant_context, v_full_star)
-
-    # n_q = plant.num_positions()
-    # n_v = plant.num_velocities()
-    # n_x_full = n_q + n_v
-    # n_u = plant.num_actuators()
-
-    # # Actuated joint indices (for logging and for S later)
-    # idx_q_act = []
-    # idx_v_act = []
-    # joint_names_act = []
-    # for i in range(plant.num_actuators()):
-    #     actuator = plant.get_joint_actuator(JointActuatorIndex(i))
-    #     joint = actuator.joint()
-    #     nq_j = joint.num_positions()
-    #     nv_j = joint.num_velocities()
-    #     q0_j = joint.position_start()
-    #     v0_j = joint.velocity_start()
-    #     for k in range(nq_j):
-    #         idx_q_act.append(q0_j + k)
-    #         joint_names_act.append(joint.name())
-    #     for k in range(nv_j):
-    #         idx_v_act.append(v0_j + k)
-    # n_act = len(idx_q_act)
-    # assert n_act == len(idx_v_act)
-
-    # print("\n" + "=" * 80)
-    # print("[LQR FULL-STATE] Linearization + equilibrium setup")
-    # print("=" * 80)
-    # print(f"  Total generalized coordinates n_q        = {n_q}")
-    # print(f"  Total generalized velocities n_v        = {n_v}")
-    # print(f"  Total full state dimension n_x_full    = {n_x_full}")
-    # print(f"  Number of actuators n_u                = {n_u}")
-    # print(f"  Number of actuated joint positions     = {n_act}")
-    # print("\n  Actuated joints (design model):")
-    # for k, name in enumerate(joint_names_act):
-    #     print(
-    #         f"    [{k:2d}] '{name}' "
-    #         f"(q index {idx_q_act[k]}, v index {idx_v_act[k]})"
-    #     )
-    # print("=" * 80 + "\n")
-
-    # # --- Check that feet are actually on the ground at the chosen q* ---
-    # check_foot_contacts_at_pose(plant, plant_context, model_instance_name="spot")
-
-    # # ------------------------------------------------------------------
-    # # 2) Define equilibrium torques u* (gravity-comp at q*, v* = 0)
-    # # ------------------------------------------------------------------
-    # derivs = plant.AllocateTimeDerivatives()
-
-    # # Gravity generalized forces (size n_v).  For each 1-DoF joint, we map
-    # # the corresponding entry of tau_g to that joint's actuator torque.
-    # tau_g = plant.CalcGravityGeneralizedForces(plant_context)
-    # u_star = np.zeros(n_u)
-    # for i in range(n_u):
-    #     actuator = plant.get_joint_actuator(JointActuatorIndex(i))
-    #     joint = actuator.joint()
-    #     assert joint.num_velocities() == 1, "Assuming 1-DoF joints for Spot"
-    #     v_index = joint.velocity_start()
-    #     u_star[i] = -tau_g[v_index]
-
-    # # Full equilibrium state
-    # x_full_star = np.concatenate([q_full_star, v_full_star])
-    
-    
-    # Nice standing pose with all feet on the ground and v = 0 (geometric guess).
+    # Geometric standing pose with all feet on the ground and v = 0.
     q_full_guess, v_full_guess = get_default_standing_state(plant)
     plant.SetPositions(plant_context, q_full_guess)
     plant.SetVelocities(plant_context, v_full_guess)
@@ -967,19 +1444,33 @@ def compute_full_joint_space_lqr_gain():
     check_foot_contacts_at_pose(plant, plant_context, model_instance_name="spot")
 
     # ------------------------------------------------------------------
-    # 2) Solve for a true static equilibrium (q*, v* = 0, u*)
+    # 2) Solve for torques u* that best support this FIXED pose
+    #    (we DO NOT move q; we only adjust actuator torques).
     # ------------------------------------------------------------------
-    q_full_star, v_full_star, u_star = solve_full_state_standing_equilibrium(
+    q_full_star = q_full_guess.copy()
+    v_full_star = np.zeros(n_v)
+
+    # Gravity generalized forces as an initial guess for torques
+    tau_g = plant.CalcGravityGeneralizedForces(plant_context)
+    u0 = np.zeros(n_u)
+    for i in range(n_u):
+        actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+        joint = actuator.joint()
+        assert joint.num_velocities() == 1, "Assuming 1-DoF joints for Spot"
+        v_index = joint.velocity_start()
+        u0[i] = -tau_g[v_index]
+
+    u_star, vdot_star, xdot_full_star = solve_fixed_pose_joint_equilibrium(
         plant=plant,
-        plant_context=plant_context,
-        q_initial=q_full_guess,
-        v_initial=v_full_guess,
-        model_instance_name="spot",
-        ground_height=0.0,
+        base_context=plant_context,
+        q_standing=q_full_star,
+        idx_v_act=idx_v_act,
+        torque_init=u0,
+        torque_reg=1e-4,
         verbose=True,
     )
 
-    # Set context to the solved equilibrium
+    # Set context to the equilibrium pose (q*, v* = 0)
     plant.SetPositions(plant_context, q_full_star)
     plant.SetVelocities(plant_context, v_full_star)
 
@@ -989,8 +1480,9 @@ def compute_full_joint_space_lqr_gain():
     # Allocate derivatives for later use in f_full
     derivs = plant.AllocateTimeDerivatives()
 
-    
-
+    # ------------------------------------------------------------------
+    # 3) Full dynamics function for numerical linearization
+    # ------------------------------------------------------------------
     def f_full(x_full: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
         Continuous-time dynamics xdot = f(x, u) for the full floating-base
@@ -1015,7 +1507,7 @@ def compute_full_joint_space_lqr_gain():
     print(f"  max |vdot|              = {np.max(np.abs(xdot0_full[n_q:])):.3e}\n")
 
     # ------------------------------------------------------------------
-    # 3) Numerical linearization around (x_full_star, u_star)
+    # 4) Numerical linearization around (x_full_star, u_star)
     # ------------------------------------------------------------------
     eps_x = 1e-6
     eps_u = 1e-4
@@ -1042,7 +1534,7 @@ def compute_full_joint_space_lqr_gain():
           f"{np.linalg.norm(xdot0_full):.3e}\n")
 
     # ------------------------------------------------------------------
-    # 4) LQR weights on FULL state (for diagnostics; we'll reduce later)
+    # 5) LQR weights on FULL state (same as before)
     # ------------------------------------------------------------------
     Q_full = np.eye(n_x_full)
 
@@ -1117,30 +1609,6 @@ def compute_full_joint_space_lqr_gain():
 
     print("\n[LQR FULL-STATE] Dominant state components for uncontrollable nonstable modes (full state):")
     bad_threshold_ctr = 1e-6
-    for i, lam in enumerate(eigvals):
-        v = eigvecs[:, i]
-        ctr = np.linalg.norm(B_full.T @ v)
-        if lam.real >= -1e-6 and ctr < bad_threshold_ctr:
-            print(f"\n  >>> Suspect mode {i} (λ = {lam})")
-            idxs = np.argsort(-np.abs(v))[:8]
-            for idx in idxs:
-                print(f"    state {idx:2d}: v[{idx}] = {v[idx]:+8.4e}")
-
-    # ------------------------------------------------------------------
-    # 5) REDUCED-STATE LQR: drop base x,y and regularize bad zero modes
-    # ------------------------------------------------------------------
-    drop_state_indices = np.array([4, 5], dtype=int)
-    keep_state_indices = np.setdiff1d(np.arange(n_x_full), drop_state_indices)
-
-    A_red = A_full[np.ix_(keep_state_indices, keep_state_indices)]
-    B_red = B_full[keep_state_indices, :]
-    Q_red = Q_full[np.ix_(keep_state_indices, keep_state_indices)]
-
-    n_x_red = A_red.shape[0]
-    print("\n[LQR FULL-STATE] Reduced-state model for LQR:")
-    print(f"  Dropping base translation positions from LQR state: indices {drop_state_indices.tolist()}")
-    print(f"  n_x_red = {n_x_red}, n_u = {B_red.shape[1]}")
-
     def describe_state_index_full(k: int) -> str:
         """Helper to print which coordinate a full state index corresponds to."""
         if k < n_q:
@@ -1163,7 +1631,30 @@ def compute_full_joint_space_lqr_gain():
             else:
                 return f"v[{idx_v}] (joint velocity)"
 
-    # Eigen-analysis on reduced system
+    for i, lam in enumerate(eigvals):
+        v = eigvecs[:, i]
+        ctr = np.linalg.norm(B_full.T @ v)
+        if lam.real >= -1e-6 and ctr < bad_threshold_ctr:
+            print(f"\n  >>> Suspect mode {i} (λ = {lam})")
+            idxs = np.argsort(-np.abs(v))[:8]
+            for idx in idxs:
+                print(f"    state {idx:2d}: v[{idx}] = {v[idx]:+8.4e}")
+
+    # ------------------------------------------------------------------
+    # 5b) REDUCED-STATE LQR: drop base x,y and regularize bad zero modes
+    # ------------------------------------------------------------------
+    drop_state_indices = np.array([4, 5], dtype=int)
+    keep_state_indices = np.setdiff1d(np.arange(n_x_full), drop_state_indices)
+
+    A_red = A_full[np.ix_(keep_state_indices, keep_state_indices)]
+    B_red = B_full[keep_state_indices, :]
+    Q_red = Q_full[np.ix_(keep_state_indices, keep_state_indices)]
+
+    n_x_red = A_red.shape[0]
+    print("\n[LQR FULL-STATE] Reduced-state model for LQR:")
+    print(f"  Dropping base translation positions from LQR state: indices {drop_state_indices.tolist()}")
+    print(f"  n_x_red = {n_x_red}, n_u = {B_red.shape[1]}")
+
     eigvals_red, eigvecs_red = np.linalg.eig(A_red)
     print("\n[LQR FULL-STATE] Eigenvalues of A_red (reduced state):")
     for i, lam in enumerate(eigvals_red):
