@@ -1,11 +1,14 @@
 services:
   spot-sim:
-    build: .
+    build:
+      context: ../..                     # build from basil root
+      dockerfile: external/spot/Dockerfile
     image: spot-sim
     ports:
-      - "7000:7000"   # meshcat
+      - "7000:7000"
     volumes:
-      - ./:/workspace/spot
+      - ../..:/workspace/basil          # mount the entire basil workspace
+    working_dir: /workspace/basil/external/spot
     stdin_open: true
     tty: true
     init: true

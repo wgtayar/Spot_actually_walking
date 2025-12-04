@@ -1,7 +1,3 @@
-# Lightweight container for running the Spot examples.
-# Uses pip to install Drake and the rest of the Python stack listed in
-# underactuated/requirements.txt.
-
 FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -28,22 +24,27 @@ RUN apt-get update && \
 # Some tools expect /usr/bin/python3; base image installs Python in /usr/local.
 RUN ln -s /usr/local/bin/python /usr/bin/python3
 
-WORKDIR /workspace/spot
+# IMPORTANT: build context is the basil root (see docker-compose.yml)
+WORKDIR /workspace/basil
 
-# Install Drake first (use a currently published version), then the rest of the deps.
-# The repo's requirements pin an older nightly that is no longer hosted, so we
-# filter that line out when installing the rest.
+# Install Drake first, then the rest of the deps from the *canonical* underactuated repo.
 ARG DRAKE_VERSION=1.47.0
-COPY underactuated/requirements.txt underactuated/requirements.txt
+
+# Copy the requirements from external/underactuated
+COPY external/underactuated/requirements.txt /tmp/underactuated_requirements.txt
+
 RUN pip install "drake==${DRAKE_VERSION}" --extra-index-url https://drake-packages.csail.mit.edu/whl/nightly && \
-    grep -v '^drake==' underactuated/requirements.txt > /tmp/requirements.nodrake && \
+    grep -v '^drake==' /tmp/underactuated_requirements.txt > /tmp/requirements.nodrake && \
     pip install -r /tmp/requirements.nodrake
 
-# Copy the rest of the workspace.
-COPY . .
+# Copy the rest of the basil workspace into the image
+COPY . /workspace/basil
 
-# Make local packages importable inside the container.
-ENV PYTHONPATH="/workspace/spot:/workspace/spot/underactuated"
+# Work from the Spot repo by default
+WORKDIR /workspace/basil/external/spot
+
+# Make both Spot and Underactuated importable
+ENV PYTHONPATH="/workspace/basil/external/spot:/workspace/basil/external/underactuated"
 
 EXPOSE 7000
 
