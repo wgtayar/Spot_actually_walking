@@ -1,0 +1,12 @@
+services:
+  spot-sim:
+    build: .
+    image: spot-sim
+    ports:
+      - "7000:7000"   # meshcat
+    volumes:
+      - ./:/workspace/spot
+    stdin_open: true
+    tty: true
+    init: true
+    command: ["bash", "run_sim_then_shell.sh"]

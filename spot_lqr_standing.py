@@ -152,6 +152,7 @@ def compute_joint_space_lqr_gain():
     # Actuated joint indices
     idx_q_act = []
     idx_v_act = []
+    joint_names_act = []
 
     for i in range(plant.num_actuators()):
         actuator = plant.get_joint_actuator(JointActuatorIndex(i))
@@ -163,12 +164,31 @@ def compute_joint_space_lqr_gain():
 
         for k in range(nq_j):
             idx_q_act.append(q0 + k)
+            joint_names_act.append(joint.name())
         for k in range(nv_j):
             idx_v_act.append(v0 + k)
 
     n_act = len(idx_q_act)
     assert n_act == len(
         idx_v_act), "Position/velocity index lists must match length"
+
+    print("\n" + "=" * 80)
+    print("[LQR] Joint-space linearization setup")
+    print("=" * 80)
+    print(f"  Total generalized coordinates n_q        = {n_q}")
+    print(f"  Total generalized velocities n_v        = {n_v}")
+    print(f"  Total full state dimension n_x_full    = {n_x_full}")
+    print(f"  Number of actuators n_u                = {n_u}")
+    print(f"  Number of actuated joint positions     = {n_act}")
+    print(f"  Joint-space state dimension n_x_joint  = {2 * n_act}")
+    print("")
+    print("  Actuated joints (design model):")
+    for k, name in enumerate(joint_names_act):
+        print(
+            f"    [{k:2d}] '{name}' "
+            f"(q index {idx_q_act[k]}, v index {idx_v_act[k]})"
+        )
+    print("=" * 80 + "\n")
 
     # Joint-space nominal state
     q_act_star = q_full_star[idx_q_act]
@@ -252,8 +272,19 @@ def compute_joint_space_lqr_gain():
     R_scale = 0.01  # smaller = allow stronger torques
     R = np.eye(n_u) * R_scale
 
+    print("[LQR] Cost weights:")
+    print(f"  Position weight (per DOF): {pos_weight}")
+    print(f"  Velocity weight (per DOF): {vel_weight}")
+    print(f"  Torque cost scaling (R_scale): {R_scale}")
+    print(f"  Q_joint shape: {Q_joint.shape}, R shape: {R.shape}")
+
     # Drake's continuous-time LQR on the joint-space model
     K_joint, _ = LinearQuadraticRegulator(A_joint, B_joint, Q_joint, R)
+
+    print("\n[LQR] LQR gain matrix K_joint:")
+    print(f"  K_joint shape: {K_joint.shape}")
+    print(f"  ‖K_joint‖_∞ = {np.max(np.abs(K_joint)):.3e}")
+    print("=" * 80 + "\n")
 
     return K_joint, x_full_star, x_joint_star, u_star, n_x_full, n_u, idx_q_act, idx_v_act
 
@@ -312,10 +343,10 @@ def build_lqr_closed_loop_diagram(K_joint,
     y0 = u_star + K_joint @ x_joint_star
 
     A_affine = np.zeros((0, 0))
-    
+
     B_affine = np.zeros((0, n_x_full))
     f0_affine = np.zeros((0,))
-    
+
     C_affine = np.zeros((n_u, 0))
     D_affine = C_full
     y0_affine = y0
@@ -339,12 +370,152 @@ def build_lqr_closed_loop_diagram(K_joint,
         actuation_port,
     )
 
-    root_diagram = builder.Build()
-    return root_diagram, plant, q_star, v_star
+    joint_names = []
+    for i in range(plant.num_actuators()):
+        actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+        joint = actuator.joint()
+        nq_j = joint.num_positions()
+        for _ in range(nq_j):
+            joint_names.append(joint.name())
 
+    root_diagram = builder.Build()
+
+    return root_diagram, plant, q_star, v_star, S, joint_names
+
+def run_lqr_sim_with_logging(
+    root_diagram,
+    plant,
+    q_star,
+    v_star,
+    K_joint,
+    x_joint_star,
+    u_star,
+    S,
+    joint_names,
+    t_final: float = 10.0,
+    dt: float = 0.05,
+    log_interval: float | None = None,
+):
+    """
+    Run the closed-loop LQR simulation and continuously log:
+      - joint-space errors (q_act - q_act* and v_act - v_act*),
+      - LQR joint torques u.
+
+    This does NOT change the controller wiring. The AffineSystem built in
+    build_lqr_closed_loop_diagram is still driving the actuation port.
+
+    We only RECONSTRUCT the same control law for logging:
+        u = u_star - K_joint (x_joint - x_joint_star),
+    with x_joint = S x_full, where S and joint_names come from
+    build_lqr_closed_loop_diagram.
+    """
+    import sys
+
+    if log_interval is None:
+        log_interval = dt  # "continuous-ish" logging
+
+    # --- Set up simulator exactly like in the PD script ---
+    simulator = Simulator(root_diagram)
+    root_context = simulator.get_mutable_context()
+
+    plant_context = plant.GetMyMutableContextFromRoot(root_context)
+    plant.SetPositions(plant_context, q_star)
+    plant.SetVelocities(plant_context, v_star)
+
+    simulator.set_target_realtime_rate(1.0)
+    simulator.Initialize()
+
+    # --- Dimension checks using S and runtime plant ---
+    n_q = plant.num_positions()
+    n_v = plant.num_velocities()
+    n_x_full_runtime = n_q + n_v
+
+    n_x_joint, n_x_full_S = S.shape
+    assert n_x_full_S == n_x_full_runtime, \
+        "S width must match runtime full state dimension [q; v]"
+    n_act = len(joint_names)
+    assert n_x_joint == 2 * n_act, \
+        "S must map full state to [q_act; v_act] of length 2 * n_act"
+
+    # Nominal joint state
+    q_act_star = x_joint_star[:n_act]
+    v_act_star = x_joint_star[n_act:]
+
+    print("=" * 80)
+    print("LQR CLOSED-LOOP STANDING SIMULATION", flush=True)
+    print("=" * 80)
+    print(f"  Number of actuated joint DOFs: {n_act}")
+    print("  Actuated joints (runtime model):")
+    for k, name in enumerate(joint_names):
+        print(f"    [{k:2d}] '{name}'")
+    print("")
+    print("  Nominal actuated joint pose (q*):")
+    for k, name in enumerate(joint_names):
+        print(f"    [{k:2d}] {name:>24s}: q* = {q_act_star[k]:+7.4f} rad")
+    print("=" * 80)
+    print("  Starting from nominal standing pose.")
+    print("  LQR controller regulates deviations around this pose using:")
+    print("    u(t) = u* - K_joint (x_joint(t) - x_joint*)", flush=True)
+    print("")
+
+    # --- Main simulation loop (PD-style pattern) ---
+    sim_duration = t_final
+    last_log_time = -1e9
+
+    try:
+        while True:
+            root_context = simulator.get_mutable_context()
+            t = root_context.get_time()
+
+            if t >= sim_duration:
+                print("\nSimulation finished.", flush=True)
+                break
+
+            # Plant state at current time
+            plant_context = plant.GetMyMutableContextFromRoot(root_context)
+            q = plant.GetPositions(plant_context)
+            v = plant.GetVelocities(plant_context)
+            x_full = np.concatenate([q, v])
+
+            # Project to actuated joint state
+            x_joint = S @ x_full
+            q_act = x_joint[:n_act]
+            v_act = x_joint[n_act:]
+
+            e_q = q_act - q_act_star
+            e_v = v_act - v_act_star
+
+            # Same law as AffineSystem
+            u = u_star - K_joint @ (x_joint - x_joint_star)
+
+            if t - last_log_time >= log_interval:
+                max_eq = float(np.max(np.abs(e_q)))
+                max_ev = float(np.max(np.abs(e_v)))
+                max_u = float(np.max(np.abs(u)))
+
+                print(f"\n[LQR] t = {t:6.3f} s")
+                print(f"  max |position error| (rad):   {max_eq:.4e}")
+                print(f"  max |velocity error| (rad/s): {max_ev:.4e}")
+                print(f"  max |joint torque|   (N·m):   {max_u:.4e}")
+                for idx, name in enumerate(joint_names):
+                    print(
+                        f"    {name:>24s}: "
+                        f"e_q = {e_q[idx]:+7.4f} rad, "
+                        f"e_v = {e_v[idx]:+7.4f} rad/s, "
+                        f"u = {u[idx]:+7.4f} N·m"
+                    )
+                sys.stdout.flush()
+                last_log_time = t
+
+            # Advance one step, like in the PD script
+            target_time = min(sim_duration, t + dt)
+            simulator.AdvanceTo(target_time)
+
+    except KeyboardInterrupt:
+        print("\nSimulation stopped by user.", flush=True)
 
 def main():
-    # LQR gain on the contact-inclusive design plant
+    # 1) Design LQR on the contact-inclusive model
     (K_joint,
      x_full_star,
      x_joint_star,
@@ -354,8 +525,13 @@ def main():
      idx_q_act,
      idx_v_act) = compute_joint_space_lqr_gain()
 
-    # Closed-loop runtime diagram with Meshcat + ground + controller.
-    root_diagram, plant, q_star, v_star = build_lqr_closed_loop_diagram(
+    # 2) Build closed-loop runtime diagram (Spot + ground + Meshcat + LQR)
+    (root_diagram,
+     plant,
+     q_star,
+     v_star,
+     S,
+     joint_names) = build_lqr_closed_loop_diagram(
         K_joint,
         x_full_star,
         x_joint_star,
@@ -366,16 +542,21 @@ def main():
         idx_v_act,
     )
 
-    simulator = Simulator(root_diagram)
-    context = simulator.get_mutable_context()
-
-    plant_context = plant.GetMyMutableContextFromRoot(context)
-    plant.SetPositions(plant_context, q_star)
-    plant.SetVelocities(plant_context, v_star)
-
-    simulator.set_target_realtime_rate(1.0)
-    simulator.Initialize()
-    simulator.AdvanceTo(5.0)
+    # 3) Run simulation with continuous logging of LQR behavior
+    run_lqr_sim_with_logging(
+        root_diagram=root_diagram,
+        plant=plant,
+        q_star=q_star,
+        v_star=v_star,
+        K_joint=K_joint,
+        x_joint_star=x_joint_star,
+        u_star=u_star,
+        S=S,
+        joint_names=joint_names,
+        t_final=10.0,     # you can tune this
+        dt=0.05,          # sim logging step
+        log_interval=0.10 # log every 0.1 s of sim time
+    )
 
 
 if __name__ == "__main__":
