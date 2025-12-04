@@ -1,3 +1,0 @@
-[submodule "underactuated"]
-	path = underactuated
-	url = git@github.com:RussTedrake/underactuated.git
