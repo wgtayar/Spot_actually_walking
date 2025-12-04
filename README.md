@@ -10,7 +10,7 @@ It builds on the MIT Underactuated Robotics Spot examples and adds:
 
 - Standing PD controllers with disturbance tests  
 - Joint-space and full-state LQR regulators  
-- MPC Control of Spot
+- MPC Control of Spot  
 - Kino-dynamic jumping and multi-step trot demos with passive knees  
 - A clean structure for extending behaviors and controllers  
 
@@ -22,33 +22,36 @@ All of this runs in simulation (no real robot required).
 
 ### 1. Clone the Repository (with All Submodules)
 
-If you are using this repo standalone:
+**Recommended (via 🌿BASIL🌿 meta-repo):**
 
 ```bash
-git clone --recurse-submodules git@github.com:wgtayar/Spot_actually_walking.git basil-spot
-cd basil-spot
-```
-
-If you are coming from the 🌿BASIL🌿 meta-repo, you should already be inside:
-
-```bash
+git clone --recurse-submodules git@github.com:wgtayar/basil.git basil
 cd basil/external/spot
 ```
 
-as long as you cloned 🌿BASIL🌿 with `--recurse-submodules`.
+This gives you both the Spot playground and the matching `external/underactuated` dependency.
+
+**Standalone usage (advanced):**
+
+```bash
+git clone git@github.com:wgtayar/Spot_actually_walking.git basil-spot
+cd basil-spot
+```
+
+If you use this repo standalone, you are responsible for making the `underactuated` Python package available yourself (for example by installing your own clone of the MIT Underactuated repo with `pip install -e /path/to/underactuated --no-deps`) and adjusting the Docker paths accordingly.
 
 ---
 
 ### 2. If You Already Cloned BUT Without Submodules
 
-If directories from underactuated or other externals look empty:
+If directories from `underactuated` or other externals look empty:
 
 ```bash
-# Standalone clone:
-git submodule update --init --recursive
-
 # From BASIL:
 cd basil
+git submodule update --init --recursive
+
+# Standalone clone:
 git submodule update --init --recursive
 ```
 
@@ -56,25 +59,31 @@ This guarantees that the required underactuated code and its submodules are pres
 
 ---
 
-### 3. Docker quickstart
+### 3. Docker quickstart (from 🌿BASIL🌿)
 
-Build the image from this folder:
+When used inside the 🌿BASIL🌿 meta-repo (recommended), the Docker setup assumes you are in:
 
 ```bash
-docker build -t spot-sim .
+cd basil/external/spot
 ```
 
-> Tip: You can skip the manual build; `docker compose` will build the image automatically the first time it runs the service.
+From there, Docker Compose will build the image using the BASIL root as the build context (so it can see `external/underactuated` and the rest of the workspace).
+
+Build the image:
+
+```bash
+docker compose build spot-sim
+```
 
 #### Option A (recommended): Run sim, then land in a shell
 
-Run the standing sim with meshcat on port 7000. Ctrl+C stops the sim and drops you into a shell in the same container (at `/workspace/spot`). Type `exit` to leave the container.
+Run the standing sim with Meshcat on port 7000. Press `Ctrl+C` to stop the sim and drop into a shell in the same container (at `/workspace/basil/external/spot`). Type `exit` to leave the container.
 
 ```bash
 docker compose run --rm --service-ports spot-sim
 ```
 
-Open http://localhost:7000 in your browser for meshcat.
+Open <http://localhost:7000> in your browser for Meshcat.
 
 #### Option B: Keep container up in the background
 
@@ -84,7 +93,7 @@ Start the service detached:
 docker compose up -d
 ```
 
-Open http://localhost:7000 for meshcat, then exec into the container to run scripts:
+Open <http://localhost:7000> for Meshcat, then exec into the container to run scripts:
 
 ```bash
 docker compose exec spot-sim bash
@@ -96,13 +105,17 @@ Stop everything when done:
 docker compose down
 ```
 
+> **Note:** The `docker-compose.yml` and `Dockerfile` are wired to the BASIL layout, with `external/underactuated` available at `/workspace/basil/external/underactuated`. If you use this Spot repo standalone, you will need to update the `build.context`, paths in the Dockerfile, and `PYTHONPATH` to match your own directory structure.
+
+---
+
 ### 4. Working with branches
 
-The container always sees whatever branch is checked out on your host because the repo is mounted into `/workspace/spot`. Typical flow:
+The container always sees whatever branch is checked out on your host because the repo is mounted into `/workspace/basil`. Typical flow (from BASIL):
 
 ```bash
-git clone --recurse-submodules git@github.com:wgtayar/Spot_actually_walking.git basil
-cd basil
+git clone --recurse-submodules git@github.com:wgtayar/basil.git basil
+cd basil/external/spot
 git checkout <branch-name>
 docker compose run --rm --service-ports spot-sim
 ```
@@ -110,80 +123,14 @@ docker compose run --rm --service-ports spot-sim
 If you switch branches and the dependencies change, rebuild the image:
 
 ```bash
-docker compose build
-```
-
-### 5. Updating BASIL Later (Including Submodules)
-
-> Tip: You can also let Docker Compose build the image automatically the first time it runs the service.
-
-Build the image from this folder:
-
-```bash
-docker build -t spot-sim .
-```
-
-### Option A (recommended): Run sim, then land in a shell
-
-Run the standing sim with Meshcat on port 7000. Press `Ctrl+C` to stop the sim and drop into a shell in the same container (at `/workspace/spot`). Type `exit` to leave the container.
-
-```bash
-docker compose run --rm --service-ports spot-sim
-```
-
-Open http://localhost:7000 in your browser for Meshcat.
-
-### Option B: Keep container up in the background
-
-```bash
-docker compose up -d
-```
-
-Open http://localhost:7000 for Meshcat, then exec into the container to run scripts:
-
-```bash
-docker compose exec spot-sim bash
-```
-
-Stop everything when done:
-
-```bash
-docker compose down
+docker compose build spot-sim
 ```
 
 ---
 
-## Working with Branches
+### 5. Running a First Demo (Local Python) (NOT Recommended)
 
-If you are using Git branches to experiment with different controllers:
-
-```bash
-# Standalone
-git clone --recurse-submodules git@github.com:wgtayar/Spot_actually_walking.git basil-spot
-cd basil-spot
-git checkout <branch-name>
-docker compose run --rm --service-ports spot-sim
-```
-
-From 🌿BASIL🌿:
-
-```bash
-cd basil/external/spot
-git checkout <branch-name>
-docker compose run --rm --service-ports spot-sim
-```
-
-If branch changes add or remove dependencies, rebuild:
-
-```bash
-docker compose build
-```
-
----
-
-## Running a First Demo (Local Python) (NOT Recommended)
-
-If you are not using Docker and have a Python environment set up (for example via `basil/requirements.txt`):
+If you are not using Docker and have a Python environment set up (for example via `basil/requirements.txt` plus `pip install -e external/underactuated --no-deps`):
 
 ```bash
 cd basil/external/spot    # or standalone clone
@@ -207,7 +154,7 @@ python3 spot_multi_step_playback.py
 ## Notes and Best Practices
 
 - Ensure both this repo and the `underactuated` dependency are initialized (`git submodule update --init --recursive` at the 🌿BASIL🌿 root is safest).  
-- Use Docker for a fully reproducible environment, or `basil/requirements.txt` for a lighter local install.  
+- Use Docker for a fully reproducible environment, or `basil/requirements.txt` + `pip install -e external/underactuated --no-deps` for a lighter local install.  
 - Treat branches as experiments: one branch per major controller or trajectory change.  
 
 ---
